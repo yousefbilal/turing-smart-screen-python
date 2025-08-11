@@ -9,6 +9,7 @@ from serial.tools import list_ports
 import uptime
 import psutil
 import library.sensors.sensors_librehardwaremonitor as sensors  # type: ignore
+import asyncio
 
 cpu_name = None
 gpu_name = None
@@ -41,9 +42,9 @@ def fmt(x: float | int | None, precision=1) -> str:
     return str(x)
 
 
-def get_disk_speed(interval=1.0):
+async def get_disk_speed(interval=1.0):
     start = psutil.disk_io_counters()
-    time.sleep(interval)
+    await asyncio.sleep(interval)
     end = psutil.disk_io_counters()
 
     read_speed = (end.read_bytes - start.read_bytes) / (1024 * 1024 * interval)  # MB/s
@@ -53,7 +54,7 @@ def get_disk_speed(interval=1.0):
     return read_speed, write_speed
 
 
-def get_stats(use_gpu: bool) -> Tuple:
+async def get_stats(use_gpu: bool) -> Tuple:
     """Returns (cpu_pct, gpu_pct, gpu_mem_used_mb, gpu_temp_c). Some may be NaN."""
 
     cpu_load = sensors.Cpu.percentage(interval=0.2)
@@ -72,7 +73,7 @@ def get_stats(use_gpu: bool) -> Tuple:
     disk_used = round(disk.used / 1024**4, 2)
     disk_percent = disk.percent
 
-    r_speed, w_speed = get_disk_speed()
+    r_speed, w_speed = await get_disk_speed()
 
     up_rate, uploaded, dl_rate, downloaded = map(
         lambda x: x / 1024**2, sensors.Net.stats("Wi-Fi", 0)
@@ -301,8 +302,6 @@ def try_write(
 
 
 def main() -> int:
-    global cpu_name
-    global gpu_name
     parser = argparse.ArgumentParser(
         description="Write CPU/GPU stats to CH340 serial as CSV lines"
     )
@@ -319,17 +318,27 @@ def main() -> int:
         help="Sampling interval in seconds (default: 1.0)",
     )
     args = parser.parse_args()
+    
+    asyncio.run(main_async(args))
+    
+    return 0
 
+
+    
+
+async def main_async(args) -> int:
+    global cpu_name
+    global gpu_name
+    
     port = args.port or find_ch340_port()
     if not port:
         print("CH340 serial not found. Will keep retrying...", file=sys.stderr)
-
+    
     ser: Optional[serial.Serial] = None
     last_err_time = 0.0  # monotonic seconds
     gpu_enabled = sensors.Gpu.is_available()
 
     cpu_name = get_cpu_name()
-
     gpu_name = simplify_gpu_name(sensors.Gpu.gpu_name) if gpu_enabled else None
 
     try:
@@ -339,8 +348,10 @@ def main() -> int:
             )
             if ser is None:
                 continue  # retry detect/open in next iteration
-
-            # Sample and send
+            async with asyncio.TaskGroup() as tg:
+                task = tg.create_task(get_stats(gpu_enabled))
+                tg.create_task(asyncio.sleep(max(0.05, float(args.interval))))
+            
             (
                 cpu_load,
                 cpu_freq,
@@ -364,7 +375,8 @@ def main() -> int:
                 uploaded,
                 dl_rate,
                 downloaded,
-            ) = get_stats(gpu_enabled)
+            ) = task.result()
+            
             line = make_csv_line(
                 cpu_load,
                 cpu_freq,
@@ -389,13 +401,13 @@ def main() -> int:
                 dl_rate,
                 downloaded,
             )
+            
             print(line)
             ok, last_err_time = try_write(ser, line, last_err_time)
             if not ok:
                 ser = None
                 continue
 
-            time.sleep(max(0.05, float(args.interval)))
     except KeyboardInterrupt:
         pass
     finally:
@@ -405,7 +417,6 @@ def main() -> int:
             except Exception:
                 pass
 
-    return 0
 
 
 if __name__ == "__main__":
