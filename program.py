@@ -53,6 +53,48 @@ async def get_disk_speed(interval=1.0):
     )  # MB/s
     return read_speed, write_speed
 
+def get_active_network_interface():
+    """Returns the name of the currently active network interface"""
+    try:
+        # Get network interface statistics
+        stats = psutil.net_if_stats()
+        io_counters = psutil.net_io_counters(pernic=True)
+        
+        # First priority: interfaces that are up and have traffic
+        active_interfaces = []
+        for iface, iface_stats in stats.items():
+            # Skip loopback and virtual interfaces on Windows
+            if (iface.lower().startswith(('loopback', 'pseudo', 'virtual')) or 
+                'loopback' in iface.lower()):
+                continue
+                
+            if iface_stats.isup and iface in io_counters:
+                # Check if interface has transferred data
+                counter = io_counters[iface]
+                if counter.bytes_sent > 0 and counter.bytes_recv > 0:
+                    active_interfaces.append((iface, counter.bytes_sent + counter.bytes_recv))
+        
+        # Return interface with most traffic
+        if active_interfaces:
+            active_interfaces.sort(key=lambda x: x[1], reverse=True)
+            return active_interfaces[0][0]
+        
+        # Second priority: any interface that's up (except virtual/loopback)
+        for iface, iface_stats in stats.items():
+            if (not iface.lower().startswith(('loopback', 'pseudo', 'virtual')) and 
+                'loopback' not in iface.lower() and iface_stats.isup):
+                return iface
+                
+        # Last resort: return Wi-Fi or the first available interface
+        for iface in stats:
+            if 'wi-fi' in iface.lower():
+                return iface
+        
+        return next(iter(stats))
+        
+    except Exception as e:
+        print(f"Error detecting network interface: {e}", file=sys.stderr)
+        return "Wi-Fi"  # Default fallback
 
 async def get_stats(use_gpu: bool) -> Tuple:
     """Returns (cpu_pct, gpu_pct, gpu_mem_used_mb, gpu_temp_c). Some may be NaN."""
@@ -75,8 +117,10 @@ async def get_stats(use_gpu: bool) -> Tuple:
 
     r_speed, w_speed = await get_disk_speed()
 
+    if_name = get_active_network_interface() 
+    
     up_rate, uploaded, dl_rate, downloaded = map(
-        lambda x: x / 1024**2, sensors.Net.stats("Wi-Fi", 0)
+        lambda x: x / 1024**2, sensors.Net.stats(if_name, 0)
     )
     gpu_load = math.nan
     gpu_mem_used = math.nan
